@@ -4304,35 +4304,81 @@ end
 local function collectPressedConns()
     Cast.pressedConns, Cast.releasedConns = {}, {}
     if not findInputAction() then return false end
-    if getconnections == nil then return false end
+    if getconnections == nil then return firesignal ~= nil end
     local ok = pcall(function()
         Cast.pressedConns  = getconnections(Cast.action.Pressed)
         Cast.releasedConns = getconnections(Cast.action.Released)
     end)
-    return ok and #Cast.pressedConns > 0
+    if ok and #Cast.pressedConns > 0 then return true end
+    return firesignal ~= nil   -- getconnections ว่างบนตัวรันนี้ = ถอยไปใช้ firesignal ตอนกดจริง
 end
 
+-- อ่านฟิลด์ของ Connection แบบไม่ throw (ตัวรันบางตัว index ฟิลด์ที่ไม่มีแล้ว error)
+S.tools.connField = function(c, name)
+    local ok, v = pcall(function() return c[name] end)
+    if ok then return v end
+    return nil
+end
+
+--- ⚠ บั๊กเฉพาะมือถือ (log จริง: ถึงจุดตกปลาแล้วยืนเฉย เกม=Idling ไม่มีตัวบล็อกใดๆ)
+---   โค้ดเดิมรองรับเฉพาะ Connection ที่เป็น "table" (type(c) == "table")
+---   ตัวรันบนมือถือหลายตัวคืน Connection เป็น userdata -> ไม่เข้าทั้งสองสาขา
+---   -> fired = 0 -> castUnderNative คืน false เงียบ ๆ ทุกรอบ = กดปุ่มเหวี่ยงไม่เคยถูกส่ง
+---   แก้: ตรวจด้วย typeof + อ่านฟิลด์ผ่าน pcall รองรับทั้ง table/userdata
+---        และถ้ายังกดไม่ได้เลย ถอยไปใช้ firesignal ยิงที่ตัว signal ตรง ๆ (ดู pressAction)
 local function fireConnections(conns)
     local fired = 0
     for _, c in ipairs(conns) do
         local ok = false
-        if type(c) == "function" then ok = pcall(c)
-        elseif type(c) == "table" then
-            if type(c.Function) == "function" then ok = pcall(c.Function)
-            elseif type(c.Fire) == "function" then ok = pcall(function() c:Fire() end)
-            elseif fireconnection ~= nil then ok = pcall(fireconnection, c) end
+        local tc = typeof(c)
+        if tc == "function" then
+            ok = pcall(c)
+        else
+            local fn = S.tools.connField(c, "Function")
+            if type(fn) == "function" then ok = pcall(fn) end
+            if not ok then
+                local fire = S.tools.connField(c, "Fire")
+                if type(fire) == "function" then ok = pcall(fire, c) end
+            end
+            if not ok and fireconnection ~= nil then ok = pcall(fireconnection, c) end
         end
         if ok then fired = fired + 1 end
     end
     return fired
 end
 
+--- บันทึกสภาพของ Connection ที่ getconnections คืนมา (ครั้งเดียวต่อ 60 วิ) — ไว้ดูว่าตัวรันนี้คืนอะไร
+S.tools.noteFireFail = function(kind, conns)
+    local t = nowReal()
+    if t - (S.fireFailLogAt or 0) < 60 then return end
+    S.fireFailLogAt = t
+    local c = conns and conns[1]
+    logWarn(("[Prog] กดปุ่มเหวี่ยง (%s) ไม่ได้: getconnections คืน %d รายการ · ชนิด=%s · Function=%s · Fire=%s · firesignal=%s · fireconnection=%s")
+        :format(tostring(kind), conns and #conns or 0, c and typeof(c) or "-",
+            c and typeof(S.tools.connField(c, "Function")) or "-",
+            c and typeof(S.tools.connField(c, "Fire")) or "-",
+            typeof(firesignal), typeof(fireconnection)))
+end
+
+--- กดปุ่ม/ปล่อยปุ่ม "FishingPrimary": ลองยิง Connection ก่อน ถ้าไม่ได้สักตัวค่อยใช้ firesignal
+S.tools.pressAction = function(kind)
+    local conns = (kind == "pressed") and Cast.pressedConns or Cast.releasedConns
+    local n = fireConnections(conns)
+    if n == 0 and firesignal ~= nil and Cast.action then
+        local sig = (kind == "pressed") and Cast.action.Pressed or Cast.action.Released
+        if pcall(firesignal, sig) then n = 1 end
+    end
+    if n == 0 then S.tools.noteFireFail(kind, conns) end
+    return n
+end
+
 --- เหวี่ยงใต้ตัวพอดี (dist=0) ผ่าน native input
 local function castUnderNative()
     local fc = getFishingController()
     if not fc then return false end
-    if not findInputAction() or #Cast.pressedConns == 0 then return false end
-    if fireConnections(Cast.pressedConns) == 0 then return false end
+    if not findInputAction() then return false end
+    if #Cast.pressedConns == 0 and firesignal == nil then return false end
+    if S.tools.pressAction("pressed") == 0 then return false end
 
     local t0 = os.clock()
     local reachedThrowing = false
@@ -4342,14 +4388,19 @@ local function castUnderNative()
         RunService.Heartbeat:Wait()
     end
     if not reachedThrowing then
-        fireConnections(Cast.releasedConns)
+        S.tools.pressAction("released")
+        -- กดสำเร็จแต่เกมไม่เข้า Throwing = handler ถูกเรียกแล้วแต่ return ทิ้ง (บล็อกฝั่งเกม) บอกไว้ให้แยกจากกรณีกดไม่ได้
+        if nowReal() - (S.noThrowLogAt or 0) > 60 then
+            S.noThrowLogAt = nowReal()
+            logWarn(("[Prog] กดปุ่มเหวี่ยงแล้วแต่เกมไม่เข้า Throwing ใน 3 วิ — state=%s"):format(tostring(fc.GetState and fc:GetState() or "?")))
+        end
         return false
     end
     local targetLuck = (CONFIG.CastPerfect and CONFIG.CastLuckTarget) or 0.5
     while S.running do
         local luck = fc.GetLuckBarValue and fc:GetLuckBarValue() or 0
         if luck >= targetLuck or os.clock() - t0 > CONFIG.CastHoldTime + 2.0 then
-            return fireConnections(Cast.releasedConns) > 0
+            return S.tools.pressAction("released") > 0
         end
         RunService.Heartbeat:Wait()
     end
@@ -4442,6 +4493,64 @@ function _G.FishingCastReport()
     end
 end
 
+--- ไม่มีน้ำเปิดในรัศมีเหวี่ยง (MaxDist = 80 = ServerMaxDistance) -> เดินเข้าหาชายฝั่ง
+--- ⚠ ที่มาของบั๊ก (log จริงบน Starter): จุดฟาร์มของ Starter คือกลาง House1 ซึ่งคำนวณสดตอนรัน
+---   ถ้าบ้านอยู่ลึกกว่า 80 studs จากทะเล findNearestOpenWater คืน nil -> castToNearestWater คืน false
+---   เงียบ ๆ ทุกรอบ -> ตัวละครยืนเฉย ๆ ที่จุดฟาร์มตลอดไป (เกมอยู่ Idling ไม่มีตัวบล็อกที่รู้จัก)
+---   เกาะอื่นไม่เป็นเพราะผู้ใช้ประกาศพิกัดริมน้ำใน CONFIG.FarmSpots ไว้แล้ว
+--- ทำงาน: สแกนวงกว้างกว่าเดิม (สูงสุด 500 studs) หาน้ำเปิดที่ใกล้ที่สุด -> ยืนห่างจากน้ำ 35 studs
+---        บนเส้นทางเดียวกัน -> จำเป็น "จุดฟาร์มใหม่" ของเกาะนี้ (farmSpotFor จะคืนจุดนี้แทน
+---        House1 = ไม่โดนลากกลับ) ถ้าผู้ใช้ประกาศ CONFIG.FarmSpots ของเกาะนั้นไว้เองจะไม่แตะ
+S.tools.relocateToShore = function()
+    local t = nowReal()
+    if t - (S.shoreTryAt or 0) < 15 then return false end   -- กันสแกนถี่ (หนัก)
+    if (S.shoreTries or 0) >= 4 then return false end        -- ลองไม่เกิน 4 ครั้งต่อรอบรัน
+    S.shoreTryAt = t
+    S.shoreTries = (S.shoreTries or 0) + 1
+
+    local hrp = root()
+    if not (hrp and hrp:IsA("BasePart")) then return false end
+    local isl = currentIslandId()
+    if isl == "" then return false end
+    if (CONFIG.FarmSpots or {})[isl] then return false end   -- ผู้ใช้ประกาศเองแล้ว = ไม่เดา
+
+    local o = hrp.Position
+    local found
+    local STEP, MAXR = 8, 500
+    for r = STEP, MAXR, STEP do
+        local samples = math.max(12, math.floor((2 * math.pi * r) / STEP))
+        for i = 0, samples - 1 do
+            local ang = (i / samples) * 2 * math.pi
+            local x, z = o.X + math.cos(ang) * r, o.Z + math.sin(ang) * r
+            if isOpenWater(x, z) then found = Vector3.new(x, getWaterY(), z) break end
+        end
+        if found then break end
+        if r % 64 == 0 then RunService.Heartbeat:Wait() end    -- ไม่ให้เฟรมกระตุกนาน
+    end
+    if not found then
+        logWarn(("[Prog] ไม่เจอน้ำเปิดในรัศมี %d studs รอบ %s — ตกปลาที่จุดนี้ไม่ได้ "
+            .. "(ใส่พิกัดริมน้ำใน CONFIG.FarmSpots[\"%s\"] เอง)"):format(MAXR, tostring(isl), tostring(isl)))
+        return false
+    end
+
+    local flat = Vector3.new(found.X - o.X, 0, found.Z - o.Z)
+    local d = flat.Magnitude
+    local stand = (d > 35) and (o + flat.Unit * (d - 35)) or o
+    local spot = Vector3.new(stand.X, o.Y, stand.Z)
+
+    S.shoreSpot = S.shoreSpot or {}
+    S.shoreSpot[isl] = spot
+    logWarn(("[Prog] ไม่มีน้ำเปิดในรัศมีเหวี่ยง (80) ที่จุดฟาร์มของ %s — น้ำใกล้สุดห่าง %.0f studs "
+        .. "-> ย้ายไปยืนริมน้ำที่ %d,%d,%d (จำเป็นจุดฟาร์มใหม่)")
+        :format(tostring(isl), d, spot.X, spot.Y, spot.Z))
+
+    S.moving = true
+    S.tools.releasePin()
+    local ok = tweenDiveTo(spot, "shore")
+    S.moving = false
+    return ok
+end
+
 --- เหวี่ยงไปน้ำเปิด: หาจุดน้ำ -> ตั้งระยะ -> หันหน้า -> set Throwing -> native cast
 local function castToNearestWater()
     local hrp = root()
@@ -4450,7 +4559,11 @@ local function castToNearestWater()
     -- ⚠ ใน raid: GetCurrentIslandId() = "" ⇒ getWaterY() คืน SEA_LEVEL (3) ซึ่งผิด
     --   และ World.Islands ไม่มีอยู่ในแมป raid -> ต้องใช้ raidCastTarget (WaterBody + indicator)
     local water = (S.raidActive and raidCastTarget and raidCastTarget()) or findNearestOpenWater(hrp.Position)
-    if not water then return false end
+    if not water then
+        -- หาน้ำในรัศมีเหวี่ยงไม่เจอ = ยืนผิดที่ ไม่ใช่เกมบล็อก -> เดินเข้าหาชายฝั่ง (ดู relocateToShore)
+        if not S.raidActive then pcall(S.tools.relocateToShore) end
+        return false
+    end
 
     local dist = Vector3.new(water.X - hrp.Position.X, 0, water.Z - hrp.Position.Z).Magnitude
     -- CalcTargetPos: dist = BaitMinDist + luck*(BaitMaxDist-BaitMinDist)
@@ -8041,6 +8154,9 @@ end
 local function farmSpotFor(islandId)
     local v = (CONFIG.FarmSpots or {})[islandId]
     if v then return v end
+    -- จุดริมน้ำที่ relocateToShore หาให้เอง (เกาะที่จุดฟาร์มเดิมไม่มีน้ำในรัศมีเหวี่ยง)
+    local shore = S.shoreSpot and S.shoreSpot[islandId]
+    if shore then return shore end
     if islandId == "island_starter" then return house1StandPoint() end
     local spawn = islandLandingSpot(islandId)
     if spawn and not S.warnedNoSpot[islandId] then
